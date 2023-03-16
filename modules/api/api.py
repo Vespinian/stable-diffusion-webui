@@ -3,6 +3,7 @@ import io
 import time
 import datetime
 import uvicorn
+import copy
 from threading import Lock
 from io import BytesIO
 from gradio.processing_utils import decode_base64_to_file
@@ -185,38 +186,64 @@ class Api:
         script_idx = script_name_to_index(script_name, script_runner.scripts)
         return script_runner.scripts[script_idx]
 
-    def init_script_args(self, request, selectable_scripts, selectable_idx, script_runner):
-        #find max idx from the scripts in runner and generate a none array to init script_args
-        last_arg_index = 1
-        for script in script_runner.scripts:
-            if last_arg_index < script.args_to:
-                last_arg_index = script.args_to
-        # None everywhere except position 0 to initialize script args
-        script_args = [None]*last_arg_index
-        # position 0 in script_arg is the idx+1 of the selectable script that is going to be run when using scripts.scripts_*2img.run()
-        if selectable_scripts:
-            script_args[selectable_scripts.args_from:selectable_scripts.args_to] = request.script_args
-            script_args[0] = selectable_idx + 1
+    def fit_script_args_at_index(self, starting_index, script_args, script, api_script_args):
+        script_length = script.args_to - script.args_from
+        api_script_length = len(api_script_args)
+        script.args_from = starting_index
+        if script_length <= api_script_length:
+            script.args_to = starting_index + api_script_length
+            script_args += api_script_args
         else:
-            # when [0] = 0 no selectable script to run
-            script_args[0] = 0
+            script.args_to = starting_index + script_length
+            script_args += api_script_args + [None] * (script_length-api_script_length)
+        return script.args_to
 
-        # Now check for always on scripts
+    def script_arg_refit(self, script_runner, script_args, script_args_to_run):
+        index = 1
+        for script in script_runner.scripts:
+            if script in script_args_to_run.keys():
+                index = self.fit_script_args_at_index(index, script_args, script, script_args_to_run[script])
+            else:
+                index = self.fit_script_args_at_index(index, script_args, script, [])
+        return script_args
+
+    def init_script_args(self, request, selectable_scripts, selectable_idx, script_runner):
+        script_args_to_run = {} # dict of scripts to run and their args
         if request.alwayson_scripts and (len(request.alwayson_scripts) > 0):
             for alwayson_script_name in request.alwayson_scripts.keys():
                 alwayson_script = self.get_script(alwayson_script_name, script_runner)
                 if alwayson_script == None:
                     raise HTTPException(status_code=422, detail=f"always on script {alwayson_script_name} not found")
-                # Selectable script in always on script param check
                 if alwayson_script.alwayson == False:
                     raise HTTPException(status_code=422, detail=f"Cannot have a selectable script in the always on scripts params")
-                # always on script with no arg should always run so you don't really need to add them to the requests
+                # all good, so add to run dict
                 if "args" in request.alwayson_scripts[alwayson_script_name]:
-                    script_args[alwayson_script.args_from:alwayson_script.args_to] = request.alwayson_scripts[alwayson_script_name]["args"]
+                    script_args_to_run[alwayson_script] = request.alwayson_scripts[alwayson_script_name]["args"]
+                else:
+                    script_args_to_run[alwayson_script] = []
+
+        # Remove always on scripts that were not included in the request by resetting the script list in our copied ScriptRunner
+        script_runner.alwayson_scripts.clear()
+        script_runner.alwayson_scripts = [key for key, value in script_args_to_run.items()]
+        script_runner.scripts.clear()
+        script_runner.scripts = [key for key, value in script_args_to_run.items()] + script_runner.selectable_scripts
+
+        script_args = [0]
+        if selectable_scripts:
+            # position 0 in script_arg is the idx+1 of the selectable script that is going to be run when using scripts.scripts_*2img.run()
+            script_args[0] = selectable_idx + 1
+            script_args_to_run[selectable_scripts] = request.script_args
+
+        # Build script_args list and refit the indices inside the scripts
+        # Behavior for fitting is:
+        # if api args length >= length of args in script then refit for api arg length
+        # else insert api args and pad with "None" to script arg length if needed
+        self.script_arg_refit(script_runner, script_args, script_args_to_run)
+
         return script_args
 
     def text2imgapi(self, txt2imgreq: StableDiffusionTxt2ImgProcessingAPI):
-        script_runner = scripts.scripts_txt2img
+        script_runner = copy.copy(scripts.scripts_txt2img) # copy so we don't overwrite our globals
         if not script_runner.scripts:
             script_runner.initialize_scripts(False)
             ui.create_ui()
@@ -268,7 +295,7 @@ class Api:
         if mask:
             mask = decode_base64_to_image(mask)
 
-        script_runner = scripts.scripts_img2img
+        script_runner = copy.copy(scripts.scripts_img2img) # copy so we don't overwrite our globals
         if not script_runner.scripts:
             script_runner.initialize_scripts(True)
             ui.create_ui()
